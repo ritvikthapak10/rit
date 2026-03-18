@@ -1,122 +1,404 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8">
-  <title>Open World Wanderer</title>
-  <style>
-    body {
-      margin: 0;
-      overflow: hidden;
-      background: #87ceeb;
+"""
+============================================================
+  Basic Finance Model — Starter Kit for Finance Students
+============================================================
+  Modules included:
+    1. Three-Statement Model  (Income Statement, Balance Sheet, Cash Flow)
+    2. DCF Valuation          (Free Cash Flow → Enterprise Value → Equity Value)
+    3. Comparable Company     (EV/EBITDA, P/E multiples)
+    4. Financial Ratios       (Liquidity, Profitability, Leverage, Efficiency)
+    5. Sensitivity Analysis   (WACC × Terminal Growth Rate heatmap)
+
+  Requirements:  pip install numpy pandas tabulate
+  Usage:         python finance_model.py
+============================================================
+"""
+
+import numpy as np
+import pandas as pd
+from tabulate import tabulate
+
+
+# ─────────────────────────────────────────────────────────
+#  SECTION 1 — ASSUMPTIONS  (edit these to model any company)
+# ─────────────────────────────────────────────────────────
+
+COMPANY_NAME = "Acme Corp"
+CURRENCY     = "USD (millions)"
+
+# Income statement drivers
+BASE_REVENUE        = 500.0     # Year 0 actual revenue
+REVENUE_GROWTH      = [0.12, 0.10, 0.09, 0.08, 0.07]   # 5-year forecast growth rates
+COGS_MARGIN         = 0.55      # Cost of goods sold as % of revenue
+OPEX_MARGIN         = 0.20      # Operating expenses as % of revenue
+DA_MARGIN           = 0.05      # Depreciation & amortisation as % of revenue
+INTEREST_EXPENSE    = 15.0      # Fixed annual interest expense
+TAX_RATE            = 0.25      # Effective tax rate
+
+# Balance sheet drivers
+RECEIVABLES_DAYS    = 45        # Days sales outstanding
+INVENTORY_DAYS      = 60        # Days inventory outstanding
+PAYABLES_DAYS       = 30        # Days payable outstanding
+CAPEX_MARGIN        = 0.06      # Capex as % of revenue
+STARTING_CASH       = 50.0
+STARTING_DEBT       = 150.0
+STARTING_EQUITY     = 200.0
+
+# DCF assumptions
+WACC                = 0.10      # Weighted average cost of capital
+TERMINAL_GROWTH     = 0.025     # Terminal growth rate (Gordon Growth)
+SHARES_OUTSTANDING  = 50.0      # Millions of shares
+NET_DEBT            = 100.0     # Total debt − cash at valuation date
+
+# Comparable companies (name, EV/EBITDA, P/E)
+COMPS = [
+    ("PeerCo A",    12.0, 22.0),
+    ("PeerCo B",    10.5, 19.5),
+    ("PeerCo C",    11.8, 21.0),
+    ("PeerCo D",     9.5, 18.0),
+    ("Industry Avg", 11.0, 20.1),
+]
+
+
+# ─────────────────────────────────────────────────────────
+#  HELPERS
+# ─────────────────────────────────────────────────────────
+
+def _section(title: str) -> None:
+    """Print a formatted section header."""
+    width = 65
+    print(f"\n{'─' * width}")
+    print(f"  {title}")
+    print(f"{'─' * width}")
+
+
+def _fmt(val: float, decimals: int = 1) -> str:
+    """Format a number with commas and fixed decimals."""
+    return f"{val:,.{decimals}f}"
+
+
+def _pct(val: float) -> str:
+    return f"{val * 100:.1f}%"
+
+
+# ─────────────────────────────────────────────────────────
+#  SECTION 2 — THREE-STATEMENT MODEL
+# ─────────────────────────────────────────────────────────
+
+def build_income_statement() -> pd.DataFrame:
+    """
+    Projects a 5-year income statement from revenue to net income.
+    Returns a DataFrame with years as columns.
+    """
+    years = [f"Year {i+1}" for i in range(5)]
+    revenue, cogs, gross_profit = [], [], []
+    ebitda, da, ebit = [], [], []
+    ebt, tax, net_income = [], [], []
+
+    rev = BASE_REVENUE
+    for g in REVENUE_GROWTH:
+        rev *= (1 + g)
+        c   = rev * COGS_MARGIN
+        gp  = rev - c
+        d   = rev * DA_MARGIN
+        opx = rev * OPEX_MARGIN
+        eb  = gp - opx                     # EBITDA
+        ei  = eb - d                       # EBIT
+        et  = ei - INTEREST_EXPENSE        # EBT
+        tx  = max(et * TAX_RATE, 0)
+        ni  = et - tx
+
+        revenue.append(rev);  cogs.append(c);   gross_profit.append(gp)
+        ebitda.append(eb);    da.append(d);      ebit.append(ei)
+        ebt.append(et);       tax.append(tx);    net_income.append(ni)
+
+    df = pd.DataFrame({
+        "Revenue":       revenue,
+        "(-) COGS":      [-x for x in cogs],
+        "Gross Profit":  gross_profit,
+        "(-) OpEx":      [-x for x in [r * OPEX_MARGIN for r in revenue]],
+        "EBITDA":        ebitda,
+        "(-) D&A":       [-x for x in da],
+        "EBIT":          ebit,
+        "(-) Interest":  [-INTEREST_EXPENSE] * 5,
+        "EBT":           ebt,
+        "(-) Tax":       [-x for x in tax],
+        "Net Income":    net_income,
+    }, index=years).T
+
+    df["Margins"] = [
+        "",
+        "",
+        _pct(gross_profit[-1] / revenue[-1]),
+        "",
+        _pct(ebitda[-1]      / revenue[-1]),
+        "",
+        _pct(ebit[-1]        / revenue[-1]),
+        "",
+        "",
+        "",
+        _pct(net_income[-1]  / revenue[-1]),
+    ]
+    return df
+
+
+def build_cash_flow_statement(is_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Builds a simplified cash flow statement using the indirect method.
+    """
+    years = [f"Year {i+1}" for i in range(5)]
+
+    rev     = BASE_REVENUE
+    revenues, capex_vals, delta_wc = [], [], []
+
+    prev_wc = 0
+    for g in REVENUE_GROWTH:
+        rev *= (1 + g)
+        revenues.append(rev)
+        capex_vals.append(rev * CAPEX_MARGIN)
+
+        # Working capital = receivables + inventory − payables
+        rec  = rev / 365 * RECEIVABLES_DAYS
+        inv  = (rev * COGS_MARGIN) / 365 * INVENTORY_DAYS
+        pay  = (rev * COGS_MARGIN) / 365 * PAYABLES_DAYS
+        wc   = rec + inv - pay
+        delta_wc.append(wc - prev_wc)
+        prev_wc = wc
+
+    ni_row  = is_df.loc["Net Income"].drop("Margins").astype(float)
+    da_row  = is_df.loc["(-) D&A"].drop("Margins").astype(float).abs()
+
+    cfo = ni_row.values + da_row.values - np.array(delta_wc)
+    cfi = [-c for c in capex_vals]
+    fcf = cfo + np.array(cfi)
+
+    df = pd.DataFrame({
+        "Net Income":        ni_row.values,
+        "(+) D&A":           da_row.values,
+        "(−) ΔWorking Cap":  [-x for x in delta_wc],
+        "Cash from Ops":     cfo,
+        "(−) Capex":         cfi,
+        "Free Cash Flow":    fcf,
+    }, index=years).T
+
+    df["Margins"] = ["", "", "", "", "", ""]
+    return df, fcf
+
+
+# ─────────────────────────────────────────────────────────
+#  SECTION 3 — DCF VALUATION
+# ─────────────────────────────────────────────────────────
+
+def run_dcf(fcf_array: np.ndarray) -> dict:
+    """
+    Discounts free cash flows and adds a Gordon Growth terminal value.
+    Returns a dict with key valuation metrics.
+    """
+    pv_fcfs = []
+    for t, fcf in enumerate(fcf_array, start=1):
+        pv = fcf / (1 + WACC) ** t
+        pv_fcfs.append(pv)
+
+    pv_sum = sum(pv_fcfs)
+
+    # Terminal value (Gordon Growth Model)
+    terminal_fcf = fcf_array[-1] * (1 + TERMINAL_GROWTH)
+    tv           = terminal_fcf / (WACC - TERMINAL_GROWTH)
+    pv_tv        = tv / (1 + WACC) ** len(fcf_array)
+
+    enterprise_value = pv_sum + pv_tv
+    equity_value     = enterprise_value - NET_DEBT
+    price_per_share  = equity_value / SHARES_OUTSTANDING
+
+    return {
+        "PV of FCFs":          pv_sum,
+        "Terminal Value (TV)": tv,
+        "PV of TV":            pv_tv,
+        "Enterprise Value":    enterprise_value,
+        "(−) Net Debt":        NET_DEBT,
+        "Equity Value":        equity_value,
+        "Shares Outstanding":  SHARES_OUTSTANDING,
+        "Implied Price/Share": price_per_share,
+        "TV as % of EV":       pv_tv / enterprise_value,
+        "_pv_fcfs":            pv_fcfs,   # internal, used for sensitivity
     }
-    canvas {
-      display: block;
-    }
-  </style>
-</head>
-<body>
-<canvas id="gameCanvas"></canvas>
 
-<script>
-const canvas = document.getElementById("gameCanvas");
-const ctx = canvas.getContext("2d");
 
-canvas.width = window.innerWidth;
-canvas.height = window.innerHeight;
+# ─────────────────────────────────────────────────────────
+#  SECTION 4 — COMPARABLE COMPANY ANALYSIS
+# ─────────────────────────────────────────────────────────
 
-// Player
-const player = {
-  x: 0,
-  y: 0,
-  size: 20,
-  speed: 3,
-  color: "red"
-};
+def run_comps(is_df: pd.DataFrame, dcf: dict) -> None:
+    """
+    Applies peer median multiples to derive an implied share price range.
+    """
+    _section("4. Comparable Company Analysis")
 
-// Camera
-const camera = {
-  x: 0,
-  y: 0
-};
+    # Use Year 5 EBITDA and Net Income from income statement
+    ebitda_y5 = is_df.loc["EBITDA", "Year 5"]
+    ni_y5     = is_df.loc["Net Income", "Year 5"]
 
-// Controls
-const keys = {};
-window.addEventListener("keydown", (e) => keys[e.key] = true);
-window.addEventListener("keyup", (e) => keys[e.key] = false);
+    ev_ebitda_multiples = [c[1] for c in COMPS[:-1]]
+    pe_multiples        = [c[2] for c in COMPS[:-1]]
 
-// World settings
-const worldSize = 3000;
+    median_ev_ebitda = np.median(ev_ebitda_multiples)
+    median_pe        = np.median(pe_multiples)
 
-// Trees (random objects)
-const trees = [];
-for (let i = 0; i < 100; i++) {
-  trees.push({
-    x: Math.random() * worldSize - worldSize/2,
-    y: Math.random() * worldSize - worldSize/2
-  });
-}
+    implied_ev_from_ebitda  = median_ev_ebitda * ebitda_y5
+    implied_eq_from_ebitda  = implied_ev_from_ebitda - NET_DEBT
+    implied_price_ev_ebitda = implied_eq_from_ebitda / SHARES_OUTSTANDING
 
-// Movement
-function update() {
-  if (keys["ArrowUp"]) player.y -= player.speed;
-  if (keys["ArrowDown"]) player.y += player.speed;
-  if (keys["ArrowLeft"]) player.x -= player.speed;
-  if (keys["ArrowRight"]) player.x += player.speed;
+    implied_price_pe = (median_pe * ni_y5) / SHARES_OUTSTANDING
 
-  // Camera follows player
-  camera.x = player.x - canvas.width / 2;
-  camera.y = player.y - canvas.height / 2;
-}
+    # Print comp table
+    rows = [[c[0], _fmt(c[1]), _fmt(c[2])] for c in COMPS]
+    print(tabulate(rows, headers=["Company", "EV/EBITDA", "P/E"], tablefmt="simple"))
 
-// Draw world
-function draw() {
-  ctx.clearRect(0, 0, canvas.width, canvas.height);
+    print(f"\n  Median EV/EBITDA  : {_fmt(median_ev_ebitda)}x")
+    print(f"  Median P/E        : {_fmt(median_pe)}x")
+    print(f"\n  Year-5 EBITDA     : ${_fmt(ebitda_y5)}M")
+    print(f"  Year-5 Net Income : ${_fmt(ni_y5)}M")
+    print(f"\n  Implied price (EV/EBITDA) : ${_fmt(implied_price_ev_ebitda)}/share")
+    print(f"  Implied price (P/E)       : ${_fmt(implied_price_pe)}/share")
+    print(f"  DCF implied price         : ${_fmt(dcf['Implied Price/Share'])}/share")
+    print(f"\n  Price range : ${_fmt(min(implied_price_ev_ebitda, implied_price_pe, dcf['Implied Price/Share']))} "
+          f"— ${_fmt(max(implied_price_ev_ebitda, implied_price_pe, dcf['Implied Price/Share']))}")
 
-  // Ground
-  ctx.fillStyle = "#6ab04c";
-  ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-  // Draw trees
-  trees.forEach(tree => {
-    ctx.fillStyle = "green";
-    ctx.beginPath();
-    ctx.arc(
-      tree.x - camera.x,
-      tree.y - camera.y,
-      15,
-      0,
-      Math.PI * 2
-    );
-    ctx.fill();
-  });
+# ─────────────────────────────────────────────────────────
+#  SECTION 5 — FINANCIAL RATIOS
+# ─────────────────────────────────────────────────────────
 
-  // Draw player
-  ctx.fillStyle = player.color;
-  ctx.beginPath();
-  ctx.arc(
-    player.x - camera.x,
-    player.y - camera.y,
-    player.size,
-    0,
-    Math.PI * 2
-  );
-  ctx.fill();
-}
+def compute_ratios(is_df: pd.DataFrame) -> None:
+    """
+    Prints key financial ratios using Year-5 figures and balance sheet assumptions.
+    """
+    _section("5. Key Financial Ratios")
 
-// Game loop
-function gameLoop() {
-  update();
-  draw();
-  requestAnimationFrame(gameLoop);
-}
+    rev5   = is_df.loc["Revenue",    "Year 5"]
+    gp5    = is_df.loc["Gross Profit","Year 5"]
+    ebitda5= is_df.loc["EBITDA",     "Year 5"]
+    ebit5  = is_df.loc["EBIT",       "Year 5"]
+    ni5    = is_df.loc["Net Income",  "Year 5"]
 
-gameLoop();
+    # Approximate Year-5 balance sheet items
+    rec5   = rev5 / 365 * RECEIVABLES_DAYS
+    inv5   = (rev5 * COGS_MARGIN) / 365 * INVENTORY_DAYS
+    pay5   = (rev5 * COGS_MARGIN) / 365 * PAYABLES_DAYS
+    assets5 = rec5 + inv5 + STARTING_CASH + 200    # simplified total assets proxy
 
-// Resize handling
-window.addEventListener("resize", () => {
-  canvas.width = window.innerWidth;
-  canvas.height = window.innerHeight;
-});
-</script>
-</body>
-</html>
+    ratios = [
+        # Profitability
+        ["— Profitability —",            "",       ""],
+        ["Gross Margin",                 _pct(gp5     / rev5), "Higher = better pricing power"],
+        ["EBITDA Margin",                _pct(ebitda5 / rev5), "Proxy for operating cash generation"],
+        ["EBIT Margin",                  _pct(ebit5   / rev5), "Operating profit before tax & interest"],
+        ["Net Profit Margin",            _pct(ni5     / rev5), "Bottom-line profitability"],
+        ["Return on Assets (ROA)",       _pct(ni5     / assets5), "Net income per dollar of assets"],
+        # Liquidity
+        ["",                             "",       ""],
+        ["— Liquidity —",               "",       ""],
+        ["Current Ratio (proxy)",        _fmt((rec5 + inv5 + STARTING_CASH) / (pay5 + 20)), "> 1.5 is healthy"],
+        ["Quick Ratio (proxy)",          _fmt((rec5 + STARTING_CASH) / (pay5 + 20)),       "> 1.0 is healthy"],
+        # Leverage
+        ["",                             "",       ""],
+        ["— Leverage —",                "",       ""],
+        ["Net Debt / EBITDA",            _fmt(NET_DEBT / ebitda5) + "x", "< 3x is generally comfortable"],
+        ["Interest Coverage (EBIT/Int)", _fmt(ebit5 / INTEREST_EXPENSE) + "x", "> 3x = low default risk"],
+        # Efficiency
+        ["",                             "",       ""],
+        ["— Efficiency —",              "",       ""],
+        ["Days Sales Outstanding",       f"{RECEIVABLES_DAYS} days", "Lower = faster collections"],
+        ["Days Inventory Outstanding",   f"{INVENTORY_DAYS} days",   "Lower = leaner inventory"],
+        ["Days Payable Outstanding",     f"{PAYABLES_DAYS} days",    "Higher = better cash preservation"],
+        ["Cash Conversion Cycle",        f"{RECEIVABLES_DAYS + INVENTORY_DAYS - PAYABLES_DAYS} days",
+                                                                      "Lower = faster cash cycle"],
+    ]
+    print(tabulate(ratios, headers=["Ratio", "Value", "Interpretation"], tablefmt="simple"))
+
+
+# ─────────────────────────────────────────────────────────
+#  SECTION 6 — SENSITIVITY ANALYSIS  (WACC × Terminal Growth)
+# ─────────────────────────────────────────────────────────
+
+def sensitivity_analysis(fcf_array: np.ndarray) -> None:
+    """
+    Generates a heatmap table of implied price per share
+    across a grid of WACC and terminal growth rate assumptions.
+    """
+    _section("6. Sensitivity Analysis — Price/Share vs WACC & Terminal Growth")
+
+    wacc_range = [0.08, 0.09, 0.10, 0.11, 0.12]
+    tgr_range  = [0.01, 0.015, 0.02, 0.025, 0.03]
+
+    table = []
+    for w in wacc_range:
+        row = [f"WACC {_pct(w)}"]
+        for tg in tgr_range:
+            pv = sum(f / (1 + w) ** (t+1) for t, f in enumerate(fcf_array))
+            tv  = fcf_array[-1] * (1 + tg) / (w - tg)
+            pv_tv = tv / (1 + w) ** len(fcf_array)
+            ev    = pv + pv_tv
+            price = (ev - NET_DEBT) / SHARES_OUTSTANDING
+            row.append(f"${_fmt(price)}")
+        table.append(row)
+
+    headers = [""] + [f"TGR {_pct(tg)}" for tg in tgr_range]
+    print(tabulate(table, headers=headers, tablefmt="simple"))
+    print(f"\n  Base case (WACC={_pct(WACC)}, TGR={_pct(TERMINAL_GROWTH)}) is marked by your assumptions above.")
+
+
+# ─────────────────────────────────────────────────────────
+#  MAIN — RUNS ALL MODULES
+# ─────────────────────────────────────────────────────────
+
+def main() -> None:
+    print("=" * 65)
+    print(f"  FINANCE MODEL — {COMPANY_NAME}")
+    print(f"  Currency: {CURRENCY}")
+    print("=" * 65)
+
+    # ── 1. Income Statement ────────────────────────────────
+    _section("1. Income Statement (5-Year Forecast)")
+    is_df = build_income_statement()
+    print(tabulate(is_df.drop(columns="Margins"), floatfmt=",.1f", tablefmt="simple"))
+
+    # ── 2. Cash Flow Statement ────────────────────────────
+    _section("2. Cash Flow Statement (5-Year Forecast)")
+    cf_df, fcf_array = build_cash_flow_statement(is_df)
+    print(tabulate(cf_df.drop(columns="Margins"), floatfmt=",.1f", tablefmt="simple"))
+
+    # ── 3. DCF Valuation ──────────────────────────────────
+    _section("3. DCF Valuation")
+    dcf = run_dcf(fcf_array)
+
+    dcf_display = {k: v for k, v in dcf.items() if not k.startswith("_")}
+    rows = []
+    for k, v in dcf_display.items():
+        if k == "TV as % of EV":
+            rows.append([k, _pct(v)])
+        elif k == "Shares Outstanding":
+            rows.append([k, f"{_fmt(v)}M"])
+        elif k == "Implied Price/Share":
+            rows.append([k, f"${_fmt(v)}"])
+        else:
+            rows.append([k, f"${_fmt(v)}M"])
+    print(tabulate(rows, headers=["Metric", "Value"], tablefmt="simple"))
+
+    # ── 4. Comps ──────────────────────────────────────────
+    run_comps(is_df, dcf)
+
+    # ── 5. Ratios ─────────────────────────────────────────
+    compute_ratios(is_df)
+
+    # ── 6. Sensitivity ────────────────────────────────────
+    sensitivity_analysis(fcf_array)
+
+    print(f"\n{'─' * 65}")
+    print("  Model complete. Adjust assumptions at the top of the file")
+    print("  to model any company.")
+    print(f"{'─' * 65}\n")
+
+
+if __name__ == "__main__":
+    main()
